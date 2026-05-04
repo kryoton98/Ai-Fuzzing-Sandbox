@@ -1,0 +1,18 @@
+# Compiled C++ Binaries
+# We never commit binaries because they are platform-specific and bloat the repo.
+sandbox
+victim
+
+# Python Virtual Environment
+# This folder contains thousands of files for the google-genai SDK. 
+# Anyone cloning the repo will run `pip install` to build their own.
+fuzzer_env/
+
+# Dynamically Generated Artifacts
+# We don't want to commit the AI's crash outputs to the main source code tree.
+crashes/
+
+# IDE and Python Cache
+.vscode/
+__pycache__/
+*.pyc
