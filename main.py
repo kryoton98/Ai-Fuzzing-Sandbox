@@ -348,9 +348,9 @@ def _build_prompt(source_code: str, language: Language) -> str:
     second line of defence regardless of whether the model obeys this rule.
     """
     if language == "python":
-        lang_label   = "Python 3"
-        fence_tag    = "python"
-        crash_modes  = textwrap.dedent("""\
+        lang_label  = "Python 3"
+        fence_tag   = "python"
+        crash_modes = textwrap.dedent("""\
             • Unhandled Exception / Crash — ZeroDivisionError, IndexError,
                                             AttributeError, RecursionError,
                                             or any exception that causes the
@@ -360,9 +360,9 @@ def _build_prompt(source_code: str, language: Language) -> str:
                                        recursion, etc.).
               • Any other abnormal exit (sys.exit with non-zero, os.abort, etc.).""")
     else:
-        lang_label   = "C++"
-        fence_tag    = "cpp"
-        crash_modes  = textwrap.dedent("""\
+        lang_label  = "C++"
+        fence_tag   = "cpp"
+        crash_modes = textwrap.dedent("""\
             • Segmentation Fault  — null pointer dereference, buffer overflow,
                                     stack smash, use-after-free, etc.
               • Infinite Loop / Hang — any input that causes the program to spin
@@ -375,9 +375,9 @@ def _build_prompt(source_code: str, language: Language) -> str:
         Carefully analyse the following {lang_label} program and identify every
         code path that could lead to a crash or an infinite hang:
 
-        ```{fence_tag}
+```{fence_tag}
         {source_code}
-        ```
+```
 
         Your task: generate exactly {NUM_PAYLOADS} distinct input strings,
         each designed to trigger one of the following behaviours when passed
@@ -396,6 +396,18 @@ def _build_prompt(source_code: str, language: Language) -> str:
             JSON strings. Use only standard printable characters or valid JSON
             Unicode escapes (e.g., \\u0000) if non-printable characters are
             necessary. C-style escapes are illegal JSON and will break parsing.
+          - CRITICAL: The output must be a single, self-contained, RFC 8259
+            compliant JSON array of plain string literals. Every element MUST
+            be a fully materialised string — do NOT embed any code, expressions,
+            operators, or language constructs inside the array. Specifically:
+              * FORBIDDEN: "a" * 100000  (Python expression)
+              * FORBIDDEN: "A" + "B"     (string concatenation operator)
+              * FORBIDDEN: str(x)        (any function call)
+              * FORBIDDEN: any value that is not a quoted string literal
+            If you want to represent a long repetitive string, write the actual
+            repeated characters inline (e.g., "AAAAAAAAAAAAAAAA...") or shorten
+            it to a reasonable length. The JSON parser that reads your output
+            has no evaluator — expressions will cause an immediate parse failure.
 
         Output ONLY a valid JSON array of exactly {NUM_PAYLOADS} strings.
         No markdown fences, no explanations, no text outside the JSON array.
