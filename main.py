@@ -1,6 +1,6 @@
 """
-main.py — AI Fuzzer WebSocket Backend  (v3: Polyglot — C++ & Python)
-════════════════════════════════════════════════════════════════════════
+main.py — AI Fuzzer WebSocket Backend  (v4: Freemium SaaS + Supabase Auth)
+════════════════════════════════════════════════════════════════════════════
 FastAPI application that exposes a single WebSocket endpoint
 (/ws/fuzz) driving the full fuzzing pipeline asynchronously:
 
@@ -9,28 +9,48 @@ FastAPI application that exposes a single WebSocket endpoint
                          (no compilation step needed).
   Stage 2 · Generate  — call the chosen AI provider with a language-aware
                          prompt to produce crash-inducing payloads.
+                         Provider tiers:
+                           gemini  — BYOK via google-genai SDK
+                           groq    — BYOK via OpenAI-compatible SDK
+                           premium — self-hosted Zero-Day Hacker Model
+                                     (requires verified Pro JWT)
   Stage 3 · Execute   — pipe each payload through the sandbox:
                            C++:    ./sandbox ./victim
                            Python: ./sandbox python3 victim.py
                          streaming stdout/stderr line-by-line in real time.
   Stage 4 · Triage    — persist CRASH / TIMEOUT artefacts to crashes/
 
-What changed in v3
+What changed in v4
 ──────────────────
+  • Supabase client initialised from SUPABASE_URL / SUPABASE_ANON_KEY env vars.
+  • New "premium" provider tier added to ALLOWED_MODELS.
+  • ws_fuzz() extracts "auth_token" from the client payload and forwards it
+    to stage_generate().
+  • stage_generate() runs a JWT gatekeeper for the premium tier:
+      1. Verifies the token via supabase.auth.get_user() (run in a thread).
+      2. Checks user_metadata["is_pro"] == True; rejects with a paywall error
+         otherwise.
+  • api_key validation is now tier-aware: premium requests are not required
+    to supply a BYOK key.
+  • _call_premium() stub simulates the self-hosted model (asyncio.sleep + 5
+    hardcoded payloads) until the real engine is ready to wire in.
+
+What was in v3 (unchanged)
+──────────────────────────
   • New "language" field in the client → server payload ("cpp" | "python").
     Defaults to "cpp" when absent for backwards compatibility.
   • Stage 1 skips g++ for Python; writes victim.py instead of victim.cpp.
   • Stage 2 prompt is language-aware: code fence, language name, and
     crash-mode descriptions adapt to the chosen language.
   • Stage 3 invokes python3 instead of the compiled binary for Python targets.
-  • Exit-code triage is language-aware: Python crashes are detected by any
-    non-zero exit code; C++ crashes are detected by exit code 139 (SIGSEGV).
+  • Exit-code triage is language-aware.
 
 What was in v2 (unchanged)
 ──────────────────────────
   • BYOK: client sends api_key, provider, model_id.
   • Multi-provider support: Gemini (google-genai) and Groq (openai SDK).
-  • Both AI calls run inside asyncio.to_thread() — event loop never blocked.
+  • Both BYOK AI calls run inside asyncio.to_thread() — event loop never blocked.
+  • JSON sanitisation (_sanitise_llm_json, _extract_json_array).
 
 WebSocket message protocol (server → client):
   {"type": "info",              "message": "..."}
@@ -44,16 +64,19 @@ WebSocket message protocol (server → client):
 
 WebSocket message protocol (client → server, once on connect):
   {
-    "source_code": "<C++ or Python source>",
-    "api_key"    : "<provider API key>",
-    "provider"   : "gemini" | "groq",
+    "source_code": "<C++ or Python source as a string>",
+    "api_key"    : "<provider API key>",      # omit / empty for premium tier
+    "provider"   : "gemini" | "groq" | "premium",
     "model_id"   : "<model string>",
-    "language"   : "cpp" | "python"   (optional, defaults to "cpp")
+    "language"   : "cpp" | "python",          # optional, defaults to "cpp"
+    "auth_token" : "<supabase JWT>"           # required for premium tier
   }
 
 Run
 ───
-  pip install fastapi uvicorn websockets google-genai openai
+  pip install fastapi uvicorn websockets google-genai openai supabase
+  export SUPABASE_URL="https://<project>.supabase.co"
+  export SUPABASE_ANON_KEY="<anon-key>"
   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
@@ -62,17 +85,68 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import textwrap
 from pathlib import Path
 from typing import Any, Literal
 
 # Language type used throughout the pipeline.
-# Defined here (rather than inline) so mypy can check exhaustiveness.
 Language = Literal["cpp", "python"]
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+
+# ── Supabase client ────────────────────────────────────────────────────────────
+#
+# Initialised once at module load from environment variables.
+# The anon key is safe to use here: we only call supabase.auth.get_user(),
+# which validates a JWT against Supabase's public key — it never exposes
+# service-role privileges.
+#
+# If either variable is absent (e.g. local dev without Supabase), the client
+# is set to None.  The premium gatekeeper checks for this and returns a
+# clear configuration error rather than crashing.
+
+from supabase import create_client, Client as SupabaseClient
+
+def _load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE pairs without requiring python-dotenv."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file(Path(".env"))
+_load_env_file(Path("fuzzer-ui/.env"))
+
+_SUPABASE_URL: str | None = (
+    os.environ.get("SUPABASE_URL")
+    or os.environ.get("VITE_SUPABASE_URL")
+)
+_SUPABASE_KEY: str | None = (
+    os.environ.get("SUPABASE_ANON_KEY")
+    or os.environ.get("VITE_SUPABASE_ANON_KEY")
+)
+
+supabase: SupabaseClient | None = (
+    create_client(_SUPABASE_URL, _SUPABASE_KEY)
+    if _SUPABASE_URL and _SUPABASE_KEY
+    else None
+)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -81,6 +155,12 @@ logging.basicConfig(
     format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 log = logging.getLogger("fuzzer")
+
+if supabase is None:
+    log.warning(
+        "SUPABASE_URL or SUPABASE_ANON_KEY not set — "
+        "premium tier will be unavailable."
+    )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -95,8 +175,9 @@ NUM_PAYLOADS   = 5
 EXEC_TIMEOUT   = 2.0      # seconds per sandbox run
 READLINE_LIMIT = 4096     # max bytes per line read from subprocess
 
-# Providers and their allowed model IDs.  Used for server-side validation
-# so a client cannot pass an arbitrary model string.
+# Providers and their allowed model IDs.
+# "premium" is the self-hosted Zero-Day Hacker Model tier — it requires a
+# verified Pro JWT and does not use a BYOK API key.
 ALLOWED_MODELS: dict[str, list[str]] = {
     "gemini": [
         "gemini-2.5-flash",
@@ -108,14 +189,21 @@ ALLOWED_MODELS: dict[str, list[str]] = {
         "llama-3.1-8b-instant",
         "mixtral-8x7b-32768",
     ],
+    "premium": [
+        "zero-day-v1",
+    ],
 }
+
+# Providers that require a BYOK api_key from the client.
+# "premium" is intentionally absent: auth is via JWT, not an API key.
+BYOK_PROVIDERS: frozenset[str] = frozenset({"gemini", "groq"})
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title       = "AI Fuzzer Backend",
     description = "Streams real-time fuzzing results over WebSocket.",
-    version     = "3.0.0",
+    version     = "4.0.0",
 )
 
 app.add_middleware(
@@ -283,8 +371,6 @@ def _extract_json_array(raw: str) -> list[str]:
     log.debug("_extract_json_array: sanitised text[:200] = %r", text[:200])
 
     # ── Strategy 1: bare JSON ─────────────────────────────────────────────
-    # Handles the ideal case where the model obeyed the prompt and returned
-    # only the array with no surrounding prose or formatting.
     try:
         result = json.loads(text)
         if isinstance(result, list):
@@ -293,9 +379,6 @@ def _extract_json_array(raw: str) -> list[str]:
         pass
 
     # ── Strategy 2: strip Markdown fences ────────────────────────────────
-    # Handles the very common case where the model wraps its output in
-    # ```json … ``` despite being told not to.  We strip both the opening
-    # fence (with optional language tag) and the closing fence, then retry.
     stripped = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     stripped = re.sub(r"\s*```\s*$",        "", stripped, flags=re.IGNORECASE)
     try:
@@ -306,9 +389,6 @@ def _extract_json_array(raw: str) -> list[str]:
         pass
 
     # ── Strategy 3: regex hunt for first [...] span ───────────────────────
-    # Handles the case where the model prepends an explanation paragraph
-    # before the array, or appends a trailing sentence after it.
-    # re.DOTALL is required so "." matches newlines inside multi-line arrays.
     match = re.search(r"\[.*?\]", text, re.DOTALL)
     if match:
         try:
@@ -319,8 +399,6 @@ def _extract_json_array(raw: str) -> list[str]:
             pass
 
     # ── All strategies exhausted ──────────────────────────────────────────
-    # Include the first 200 chars of the *sanitised* text (not raw) so the
-    # log shows what the parser actually received, not the original input.
     raise ValueError(
         "Could not extract a valid JSON array from the model response "
         "after sanitisation and three parse strategies.\n"
@@ -462,8 +540,6 @@ def _call_groq(api_key: str, model_id: str, prompt: str) -> str:
         base_url = "https://api.groq.com/openai/v1",
     )
 
-    # The prompt is split into a system directive and a user message so that
-    # the model receives a strong framing before it sees the source code.
     chat = client.chat.completions.create(
         model    = model_id,
         messages = [
@@ -486,51 +562,184 @@ def _call_groq(api_key: str, model_id: str, prompt: str) -> str:
     return chat.choices[0].message.content or ""
 
 
+async def _call_premium(model_id: str, prompt: str) -> str:
+    """
+    Stub for the self-hosted Zero-Day Hacker Model inference engine.
+
+    This function simulates the network round-trip to the model server with a
+    2-second sleep, then returns a hardcoded JSON payload array.  It is async-
+    native (no to_thread wrapper needed) so the event loop stays responsive
+    while the mock "inference" runs.
+
+    When the real model server is ready, replace the sleep + return below with
+    an aiohttp / httpx POST to the inference endpoint, keeping the same
+    function signature so the call-site in stage_generate needs no changes.
+
+    The returned string is passed through the same _extract_json_array()
+    sanitisation pipeline used for BYOK providers — ensuring the premium path
+    is subject to identical output validation.
+    """
+    log.info("_call_premium: simulating inference for model=%s", model_id)
+
+    # Simulate model latency (replace with real async HTTP call when ready)
+    await asyncio.sleep(2)
+
+    # Hardcoded payloads covering the core crash + hang + injection surface:
+    #   "CRASH"        — triggers the null-deref / ZeroDivisionError path
+    #   "LOOP"         — triggers the infinite-spin path
+    #   "A" * 256      — long string for buffer-boundary probing
+    #   "admin' --"    — classic SQL / shell injection probe
+    #   "%x%x%x%x"    — format-string vulnerability probe
+    payloads = ["CRASH", "LOOP", "A" * 256, "admin' --", "%x%x%x%x"]
+    return json.dumps(payloads)
+
+
+def _verify_supabase_user(token: str):  # type: ignore[return]
+    """
+    Blocking wrapper around supabase.auth.get_user().
+
+    supabase-py v2's auth methods are synchronous.  This function is designed
+    to be called exclusively via asyncio.to_thread() so the event loop is
+    never blocked by the network round-trip to Supabase's auth endpoint.
+
+    Returns the UserResponse object on success.
+    Raises an exception on any failure (invalid token, network error, etc.).
+    """
+    if supabase is None:
+        raise RuntimeError(
+            "Supabase client is not configured — "
+            "set SUPABASE_URL and SUPABASE_ANON_KEY environment variables."
+        )
+    # get_user() validates the JWT's signature against Supabase's public key
+    # and returns the associated user record.  An invalid or expired token
+    # raises gotrue.errors.AuthApiError.
+    response = supabase.auth.get_user(token)
+    return response
+
+
 async def stage_generate(
     ws         : WebSocket,
     source_code: str,
     api_key    : str,
-    provider   : Literal["gemini", "groq"],
+    provider   : Literal["gemini", "groq", "premium"],
     model_id   : str,
     language   : Language = "cpp",
+    auth_token : str = "",
 ) -> list[str] | None:
     """
     Call the chosen AI provider to analyse source_code and return payloads.
+
+    Provider routing
+    ────────────────
+    gemini  — BYOK; offloaded to asyncio.to_thread(_call_gemini)
+    groq    — BYOK; offloaded to asyncio.to_thread(_call_groq)
+    premium — JWT-gated; calls _call_premium() directly (native async)
+
+    Premium gatekeeper (runs before any inference)
+    ───────────────────────────────────────────────
+    1. Rejects if auth_token is absent.
+    2. Verifies the JWT via supabase.auth.get_user() (in a thread).
+    3. Rejects with a paywall error if user_metadata["is_pro"] is not True.
+
+    All three rejection paths stream an "info" error message to the client
+    and return None so ws_fuzz() can exit cleanly without a traceback.
 
     The language parameter is forwarded to _build_prompt so the model
     receives a correctly framed prompt ("C++ program" vs "Python 3 program",
     appropriate code fence, and language-specific crash-mode descriptions).
 
-    Both provider branches make blocking HTTP calls, so both are offloaded
-    to a thread via asyncio.to_thread().  This keeps the WebSocket event loop
-    free to handle other connections and heartbeats while we wait for the API.
-
-    Returns None on failure; the error has already been streamed to the client.
+    Returns None on any failure; the error has already been streamed to the
+    client.
     """
     await send_info(ws, f"Stage 2 — Asking {provider}/{model_id} to generate payloads …")
 
-    prompt = _build_prompt(source_code, language)
+    # ── Premium gatekeeper ─────────────────────────────────────────────────────
+    if provider == "premium":
 
-    try:
-        if provider == "gemini":
-            raw_text: str = await asyncio.to_thread(
-                _call_gemini, api_key, model_id, prompt
+        # 1. Token presence check
+        if not auth_token:
+            await send_info(
+                ws,
+                "ERROR: Authentication required for the premium tier. "
+                "No auth_token was provided."
             )
-        elif provider == "groq":
-            raw_text = await asyncio.to_thread(
-                _call_groq, api_key, model_id, prompt
-            )
-        else:
-            # Defensive: ws_fuzz validates provider before calling us, but
-            # keep this guard in case stage_generate is called directly.
-            await send_info(ws, f"ERROR: Unknown provider '{provider}'.")
             return None
 
-    except Exception as exc:
-        await send_info(ws, f"ERROR: {provider} API call failed — {exc}")
-        log.exception("AI provider error (%s/%s)", provider, model_id)
-        return None
+        # 2. JWT verification — run in a thread; supabase-py is blocking
+        try:
+            user_response = await asyncio.to_thread(_verify_supabase_user, auth_token)
+            user = user_response.user
+        except Exception as exc:
+            # Covers: expired token, tampered token, network failure, misconfigured client
+            log.warning("Premium auth failure: %s", exc)
+            await send_info(
+                ws,
+                f"ERROR: Authentication failed — {exc}. "
+                "Please log in again and retry."
+            )
+            return None
 
+        # 3. Pro entitlement check
+        # user_metadata is a plain dict; we use .get() with a strict True
+        # comparison to prevent any truthy-but-not-pro value from slipping through
+        # (e.g. the string "true", the integer 1, or an accidentally set flag).
+        is_pro: bool = (
+            user is not None
+            and isinstance(user.user_metadata, dict)
+            and user.user_metadata.get("is_pro") is True
+        )
+        if not is_pro:
+            log.info(
+                "Paywall rejection: uid=%s  is_pro=%s",
+                getattr(user, "id", "unknown"),
+                getattr(user, "user_metadata", {}).get("is_pro") if user else "N/A",
+            )
+            await send_info(
+                ws,
+                "ERROR: Upgrade to Pro required. "
+                "The Zero-Day Hacker Model is only available on the Pro plan."
+            )
+            return None
+
+        log.info(
+            "Premium access granted: uid=%s",
+            getattr(user, "id", "unknown"),
+        )
+
+        # 4. Run premium inference (native async — no to_thread needed)
+        prompt = _build_prompt(source_code, language)
+        try:
+            raw_text = await _call_premium(model_id, prompt)
+        except Exception as exc:
+            await send_info(ws, f"ERROR: Premium model call failed — {exc}")
+            log.exception("Premium inference error (model=%s)", model_id)
+            return None
+
+    # ── BYOK providers (gemini / groq) ─────────────────────────────────────────
+    else:
+        prompt = _build_prompt(source_code, language)
+
+        try:
+            if provider == "gemini":
+                raw_text: str = await asyncio.to_thread(
+                    _call_gemini, api_key, model_id, prompt
+                )
+            elif provider == "groq":
+                raw_text = await asyncio.to_thread(
+                    _call_groq, api_key, model_id, prompt
+                )
+            else:
+                # Defensive: ws_fuzz validates provider before calling us, but
+                # keep this guard in case stage_generate is called directly.
+                await send_info(ws, f"ERROR: Unknown provider '{provider}'.")
+                return None
+
+        except Exception as exc:
+            await send_info(ws, f"ERROR: {provider} API call failed — {exc}")
+            log.exception("AI provider error (%s/%s)", provider, model_id)
+            return None
+
+    # ── Parse and validate the response (all providers) ───────────────────────
     try:
         payloads = _extract_json_array(raw_text)
     except ValueError as exc:
@@ -700,7 +909,7 @@ async def stage_execute(ws: WebSocket, payloads: list[str],
             await asyncio.gather(stdout_task, stderr_task)
             exit_code = proc.returncode
 
-            # ── Language-aware crash detection ──────────────────────
+            # ── Language-aware crash detection ──────────────────────────
             # C++:    exit 139 = 128 + SIGSEGV(11) — memory corruption.
             #         Other non-zero exits are classified ERROR not CRASH
             #         because they may be sandbox or setup failures.
@@ -777,14 +986,16 @@ async def ws_fuzz(ws: WebSocket) -> None:
     Expected client message (once, on connect):
       {
         "source_code": "<C++ or Python source as a string>",
-        "api_key"    : "<provider API key>",
-        "provider"   : "gemini" | "groq",
+        "api_key"    : "<provider API key>",      # empty/omit for premium
+        "provider"   : "gemini" | "groq" | "premium",
         "model_id"   : "<model string>",
-        "language"   : "cpp" | "python"   (optional, defaults to "cpp")
+        "language"   : "cpp" | "python",          # optional, defaults to "cpp"
+        "auth_token" : "<supabase JWT>"           # required for premium tier
       }
 
     The api_key is used only for the duration of this request and is never
-    logged or persisted.  It does not survive the function call.
+    logged or persisted.  The auth_token is verified server-side and also
+    never logged.
     """
     await ws.accept()
     log.info("WebSocket connected: %s", ws.client)
@@ -804,11 +1015,6 @@ async def ws_fuzz(ws: WebSocket) -> None:
             if not isinstance(source_code, str) or not source_code.strip():
                 raise ValueError("source_code is empty or not a string")
 
-            api_key: str = msg.get("api_key", "").strip()
-            if not api_key:
-                await send_info(ws, "ERROR: api_key is required.")
-                return
-
             provider: str = msg.get("provider", "").strip().lower()
             if provider not in ALLOWED_MODELS:
                 await send_info(
@@ -827,6 +1033,18 @@ async def ws_fuzz(ws: WebSocket) -> None:
                 )
                 return
 
+            # api_key is required only for BYOK providers.
+            # For "premium", the JWT (auth_token) is the credential instead;
+            # an absent api_key is expected and must not be rejected here.
+            api_key: str = msg.get("api_key", "").strip()
+            if provider in BYOK_PROVIDERS and not api_key:
+                await send_info(ws, "ERROR: api_key is required for BYOK providers.")
+                return
+
+            # auth_token is forwarded to stage_generate; the premium gatekeeper
+            # there will validate it and check the Pro entitlement flag.
+            auth_token: str = msg.get("auth_token", "").strip()
+
             # language defaults to "cpp" for backwards compatibility with
             # clients that pre-date the polyglot upgrade.
             raw_lang = msg.get("language", "cpp")
@@ -843,10 +1061,12 @@ async def ws_fuzz(ws: WebSocket) -> None:
             return
 
         log.info(
-            "Request: provider=%s  model=%s  language=%s  source_len=%d",
+            "Request: provider=%s  model=%s  language=%s  source_len=%d  "
+            "has_api_key=%s  has_auth_token=%s",
             provider, model_id, language, len(source_code),
+            bool(api_key), bool(auth_token),
+            # NOTE: actual key / token values are intentionally excluded from logs
         )
-        # NOTE: api_key is intentionally excluded from logs.
 
         # ── Stage 1: Compile / write source ──────────────────────────────
         if not await stage_compile(ws, source_code, language):
@@ -857,9 +1077,10 @@ async def ws_fuzz(ws: WebSocket) -> None:
             ws          = ws,
             source_code = source_code,
             api_key     = api_key,
-            provider    = provider,   # type: ignore[arg-type]
+            provider    = provider,        # type: ignore[arg-type]
             model_id    = model_id,
             language    = language,
+            auth_token  = auth_token,      # forwarded to premium gatekeeper
         )
         if payloads is None:
             return
@@ -893,7 +1114,11 @@ async def ws_fuzz(ws: WebSocket) -> None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "version": "3.0.0"}
+    return {
+        "status"          : "ok",
+        "version"         : "4.0.0",
+        "supabase_ready"  : supabase is not None,
+    }
 
 
 @app.get("/providers")
