@@ -1,32 +1,36 @@
 """
-main.py — AI Fuzzer WebSocket Backend  (v2: BYOK Multi-Provider)
+main.py — AI Fuzzer WebSocket Backend  (v3: Polyglot — C++ & Python)
 ════════════════════════════════════════════════════════════════════════
 FastAPI application that exposes a single WebSocket endpoint
 (/ws/fuzz) driving the full fuzzing pipeline asynchronously:
 
-  Stage 1 · Compile   — save received C++ source, invoke g++ via
-                         asyncio subprocess (never blocks the server)
-  Stage 2 · Generate  — call the chosen AI provider to produce payloads
-  Stage 3 · Execute   — pipe each payload through ./sandbox ./victim,
-                         streaming stdout/stderr line-by-line in real time
+  Stage 1 · Compile   — C++: write source & invoke g++ via asyncio
+                         subprocess.  Python: write source to victim.py
+                         (no compilation step needed).
+  Stage 2 · Generate  — call the chosen AI provider with a language-aware
+                         prompt to produce crash-inducing payloads.
+  Stage 3 · Execute   — pipe each payload through the sandbox:
+                           C++:    ./sandbox ./victim
+                           Python: ./sandbox python3 victim.py
+                         streaming stdout/stderr line-by-line in real time.
   Stage 4 · Triage    — persist CRASH / TIMEOUT artefacts to crashes/
 
-What changed in v2
+What changed in v3
 ──────────────────
-  • BYOK ("Bring Your Own Key"): no server-side API keys required.
-    The client sends api_key, provider, and model_id in the initial
-    WebSocket message.  The server instantiates the AI client per-request
-    using only the caller-supplied credentials.
+  • New "language" field in the client → server payload ("cpp" | "python").
+    Defaults to "cpp" when absent for backwards compatibility.
+  • Stage 1 skips g++ for Python; writes victim.py instead of victim.cpp.
+  • Stage 2 prompt is language-aware: code fence, language name, and
+    crash-mode descriptions adapt to the chosen language.
+  • Stage 3 invokes python3 instead of the compiled binary for Python targets.
+  • Exit-code triage is language-aware: Python crashes are detected by any
+    non-zero exit code; C++ crashes are detected by exit code 139 (SIGSEGV).
 
-  • Multi-provider support:
-      gemini  — google-genai SDK, safety settings set to BLOCK_NONE for
-                HARM_CATEGORY_DANGEROUS_CONTENT so exploit prompts aren't
-                filtered.
-      groq    — openai SDK pointed at https://api.groq.com/openai/v1,
-                using chat.completions.create with a system role.
-
-  Both branches run inside asyncio.to_thread() so the event loop is
-  never blocked by a synchronous HTTP call.
+What was in v2 (unchanged)
+──────────────────────────
+  • BYOK: client sends api_key, provider, model_id.
+  • Multi-provider support: Gemini (google-genai) and Groq (openai SDK).
+  • Both AI calls run inside asyncio.to_thread() — event loop never blocked.
 
 WebSocket message protocol (server → client):
   {"type": "info",              "message": "..."}
@@ -40,10 +44,11 @@ WebSocket message protocol (server → client):
 
 WebSocket message protocol (client → server, once on connect):
   {
-    "source_code": "<C++ source>",
+    "source_code": "<C++ or Python source>",
     "api_key"    : "<provider API key>",
     "provider"   : "gemini" | "groq",
-    "model_id"   : "<model string>"
+    "model_id"   : "<model string>",
+    "language"   : "cpp" | "python"   (optional, defaults to "cpp")
   }
 
 Run
@@ -62,6 +67,10 @@ import textwrap
 from pathlib import Path
 from typing import Any, Literal
 
+# Language type used throughout the pipeline.
+# Defined here (rather than inline) so mypy can check exhaustiveness.
+Language = Literal["cpp", "python"]
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -76,8 +85,9 @@ log = logging.getLogger("fuzzer")
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 SANDBOX_BIN    = "./sandbox"
-VICTIM_BIN     = "./victim"
-VICTIM_SRC     = "./victim.cpp"
+VICTIM_BIN     = "./victim"       # compiled C++ binary
+VICTIM_SRC     = "./victim.cpp"   # C++ source written by stage_compile
+VICTIM_PY      = "./victim.py"    # Python source written by stage_compile
 CRASHES_DIR    = Path("crashes")
 COMPILE_CMD    = ["g++", "-std=c++17", "-O0", "-fno-stack-protector",
                   "-o", VICTIM_BIN, VICTIM_SRC]
@@ -105,7 +115,7 @@ ALLOWED_MODELS: dict[str, list[str]] = {
 app = FastAPI(
     title       = "AI Fuzzer Backend",
     description = "Streams real-time fuzzing results over WebSocket.",
-    version     = "2.0.0",
+    version     = "3.0.0",
 )
 
 app.add_middleware(
@@ -149,14 +159,38 @@ async def send_result(ws: WebSocket, index: int, payload: str,
 
 # ── Stage 1: Compile ───────────────────────────────────────────────────────────
 
-async def stage_compile(ws: WebSocket, source_code: str) -> bool:
+async def stage_compile(ws: WebSocket, source_code: str,
+                        language: Language) -> bool:
     """
-    Write source_code to disk and compile it with g++.
+    Stage 1: prepare the target binary or script for execution.
+
+    C++ path
+    ────────
+    Write source_code to victim.cpp and compile it with g++.  Uses
+    asyncio.create_subprocess_exec so the event loop stays live while the
+    compiler runs; large projects do not stall other WebSocket sessions.
+
+    Python path
+    ───────────
+    No compilation is needed.  Write source_code to victim.py and return
+    immediately.  The file is executed by python3 inside the sandbox at
+    Stage 3.
 
     Returns True on success, False on any failure (error already streamed).
-    Uses asyncio.create_subprocess_exec so the event loop stays live while
-    the compiler runs; large projects don't stall other WebSocket sessions.
     """
+    if language == "python":
+        # ── Python: write script, skip compilation ────────────────────────
+        await send_info(ws, "Stage 1 — Writing victim.py (Python — no compilation needed) …")
+        try:
+            Path(VICTIM_PY).write_text(source_code, encoding="utf-8")
+        except OSError as exc:
+            await send(ws, {"type": "compile_error",
+                            "data": f"Cannot write {VICTIM_PY}: {exc}"})
+            return False
+        await send_info(ws, f"victim.py written ({len(source_code)} chars).")
+        return True
+
+    # ── C++: write source and compile with g++ ────────────────────────────
     await send_info(ws, "Stage 1 — Compiling victim.cpp …")
 
     try:
@@ -294,28 +328,54 @@ def _extract_json_array(raw: str) -> list[str]:
     )
 
 
-def _build_prompt(source_code: str) -> str:
+def _build_prompt(source_code: str, language: Language) -> str:
     """
     Return the fuzzing prompt — shared by both provider branches.
 
-    The CRITICAL formatting rule at the end of the Guidelines section was
-    added to combat a recurring failure mode: Llama 3 (via Groq) and some
-    Gemini configurations emit C-style hex escapes such as \\x00 or \\xff
-    when generating binary/non-ASCII payloads.  These are valid in Python
-    and C string literals but are *illegal* in JSON, which only permits
-    \\uXXXX Unicode escapes.  Explicit instruction in the prompt reduces
-    (though cannot fully eliminate) the frequency of this error.
+    The prompt adapts to the target language in three places:
+      1. Opening sentence: "C++ program" vs "Python 3 program".
+      2. Code fence tag:   ```cpp vs ```python  (helps models with syntax
+         highlighting in their context window, slightly improving analysis).
+      3. Crash-mode description: C++ lists memory-corruption categories;
+         Python lists unhandled-exception categories instead, since Python
+         does not SIGSEGV in the same way.
+
+    The CRITICAL hex-escape rule is unchanged — it applies equally to both
+    languages because the *output* (the JSON payload array) is always JSON
+    regardless of which language the *target* is written in.
 
     Note: _extract_json_array() applies a regex sanitisation pass as a
     second line of defence regardless of whether the model obeys this rule.
     """
+    if language == "python":
+        lang_label   = "Python 3"
+        fence_tag    = "python"
+        crash_modes  = textwrap.dedent("""\
+            • Unhandled Exception / Crash — ZeroDivisionError, IndexError,
+                                            AttributeError, RecursionError,
+                                            or any exception that causes the
+                                            interpreter to exit non-zero.
+              • Infinite Loop / Hang — any input that causes the program to spin
+                                       or block forever (while True, unbounded
+                                       recursion, etc.).
+              • Any other abnormal exit (sys.exit with non-zero, os.abort, etc.).""")
+    else:
+        lang_label   = "C++"
+        fence_tag    = "cpp"
+        crash_modes  = textwrap.dedent("""\
+            • Segmentation Fault  — null pointer dereference, buffer overflow,
+                                    stack smash, use-after-free, etc.
+              • Infinite Loop / Hang — any input that causes the program to spin
+                                       or block forever.
+              • Any other undefined behaviour resulting in an abnormal exit.""")
+
     return textwrap.dedent(f"""\
         You are an expert vulnerability researcher and fuzzing specialist.
 
-        Carefully analyse the following C++ program and identify every code
-        path that could lead to a crash or an infinite hang:
+        Carefully analyse the following {lang_label} program and identify every
+        code path that could lead to a crash or an infinite hang:
 
-        ```cpp
+        ```{fence_tag}
         {source_code}
         ```
 
@@ -323,11 +383,7 @@ def _build_prompt(source_code: str) -> str:
         each designed to trigger one of the following behaviours when passed
         to the program via stdin:
 
-          • Segmentation Fault  — null pointer dereference, buffer overflow,
-                                  stack smash, use-after-free, etc.
-          • Infinite Loop / Hang — any input that causes the program to spin
-                                   or block forever.
-          • Any other undefined behaviour resulting in an abnormal exit.
+          {crash_modes}
 
         Guidelines:
           - Each string must be a single line (no embedded newlines).
@@ -403,8 +459,9 @@ def _call_groq(api_key: str, model_id: str, prompt: str) -> str:
                 "role"   : "system",
                 "content": (
                     "You are an expert vulnerability researcher and fuzzing specialist. "
-                    "When asked to analyse C++ code, you respond ONLY with a valid JSON "
-                    "array of input strings — no markdown fences, no prose, no explanation."
+                    "When asked to analyse C++ or Python code, you respond ONLY with a "
+                    "valid JSON array of input strings — no markdown fences, no prose, "
+                    "no explanation."
                 ),
             },
             {
@@ -423,9 +480,14 @@ async def stage_generate(
     api_key    : str,
     provider   : Literal["gemini", "groq"],
     model_id   : str,
+    language   : Language = "cpp",
 ) -> list[str] | None:
     """
     Call the chosen AI provider to analyse source_code and return payloads.
+
+    The language parameter is forwarded to _build_prompt so the model
+    receives a correctly framed prompt ("C++ program" vs "Python 3 program",
+    appropriate code fence, and language-specific crash-mode descriptions).
 
     Both provider branches make blocking HTTP calls, so both are offloaded
     to a thread via asyncio.to_thread().  This keeps the WebSocket event loop
@@ -435,7 +497,7 @@ async def stage_generate(
     """
     await send_info(ws, f"Stage 2 — Asking {provider}/{model_id} to generate payloads …")
 
-    prompt = _build_prompt(source_code)
+    prompt = _build_prompt(source_code, language)
 
     try:
         if provider == "gemini":
@@ -516,7 +578,8 @@ async def _stream_until_eof(
 
 
 def _save_crash(index: int, payload: str, reason: str,
-                exit_code: int | None) -> Path:
+                exit_code: int | None,
+                command: str = f"{SANDBOX_BIN} {VICTIM_BIN}") -> Path:
     """Persist a crashing payload + triage note to crashes/."""
     CRASHES_DIR.mkdir(exist_ok=True)
     out_path = CRASHES_DIR / f"payload_{index:03d}.txt"
@@ -525,7 +588,7 @@ def _save_crash(index: int, payload: str, reason: str,
         # ─────────────────────────────────────────────
         # Reason    : {reason}
         # Exit code : {exit_code if exit_code is not None else "N/A"}
-        # Command   : {SANDBOX_BIN} {VICTIM_BIN}
+        # Command   : {command}
         # ─────────────────────────────────────────────
 
         {payload}
@@ -534,9 +597,27 @@ def _save_crash(index: int, payload: str, reason: str,
     return out_path
 
 
-async def stage_execute(ws: WebSocket, payloads: list[str]) -> list[dict]:
+async def stage_execute(ws: WebSocket, payloads: list[str],
+                        language: Language = "cpp") -> list[dict]:
     """
     Run each payload through the sandbox and triage the results.
+
+    Sandbox command
+    ───────────────
+    C++:    ./sandbox ./victim
+    Python: ./sandbox python3 victim.py
+
+    The sandbox enforces namespace isolation, pivot_root filesystem jail,
+    cgroups v2 resource limits, privilege drop, and a seccomp-BPF filter
+    regardless of which language is being executed.
+
+    Crash detection
+    ───────────────
+    C++:    exit code 139 (128 + SIGSEGV) → CRASH.  Other non-zero exits
+            that aren't timeouts are classified as ERROR.
+    Python: any non-zero exit code → CRASH (unhandled exception / sys.exit
+            with non-zero status).  Python does not typically SIGSEGV, but
+            any non-zero exit means the interpreter terminated abnormally.
 
     Design notes
     ────────────
@@ -550,6 +631,12 @@ async def stage_execute(ws: WebSocket, payloads: list[str]) -> list[dict]:
     """
     results: list[dict] = []
 
+    # Pre-build the sandbox command once — it's the same for every payload.
+    if language == "python":
+        sandbox_cmd = (SANDBOX_BIN, "python3", VICTIM_PY)
+    else:
+        sandbox_cmd = (SANDBOX_BIN, VICTIM_BIN)
+
     for idx, payload in enumerate(payloads):
         await send_info(
             ws,
@@ -559,7 +646,7 @@ async def stage_execute(ws: WebSocket, payloads: list[str]) -> list[dict]:
         # ── Launch sandbox ──────────────────────────────────────────────
         try:
             proc = await asyncio.create_subprocess_exec(
-                SANDBOX_BIN, VICTIM_BIN,
+                *sandbox_cmd,
                 stdin  = asyncio.subprocess.PIPE,
                 stdout = asyncio.subprocess.PIPE,
                 stderr = asyncio.subprocess.PIPE,
@@ -601,12 +688,26 @@ async def stage_execute(ws: WebSocket, payloads: list[str]) -> list[dict]:
             await asyncio.gather(stdout_task, stderr_task)
             exit_code = proc.returncode
 
-            if exit_code == 139:      # 128 + SIGSEGV (11)
-                outcome = "CRASH"
-            elif exit_code == 0:
-                outcome = "CLEAN"
+            # ── Language-aware crash detection ──────────────────────
+            # C++:    exit 139 = 128 + SIGSEGV(11) — memory corruption.
+            #         Other non-zero exits are classified ERROR not CRASH
+            #         because they may be sandbox or setup failures.
+            # Python: any non-zero exit = unhandled exception (CRASH).
+            #         The interpreter does not SIGSEGV; non-zero exits
+            #         reliably indicate ZeroDivisionError, AttributeError,
+            #         RecursionError, sys.exit(n≠0), etc.
+            if language == "python":
+                if exit_code != 0:
+                    outcome = "CRASH"
+                else:
+                    outcome = "CLEAN"
             else:
-                outcome = "ERROR"
+                if exit_code == 139:      # 128 + SIGSEGV (11)
+                    outcome = "CRASH"
+                elif exit_code == 0:
+                    outcome = "CLEAN"
+                else:
+                    outcome = "ERROR"
 
         except asyncio.TimeoutError:
             proc.kill()
@@ -629,12 +730,18 @@ async def stage_execute(ws: WebSocket, payloads: list[str]) -> list[dict]:
 
         # ── Triage ──────────────────────────────────────────────────────
         if outcome in ("CRASH", "TIMEOUT"):
-            reason = (
-                "SIGSEGV (exit 139) — null-deref or memory corruption"
-                if outcome == "CRASH"
-                else f"HANG — process did not exit within {EXEC_TIMEOUT}s"
-            )
-            crash_path = _save_crash(idx, payload, reason, exit_code)
+            if outcome == "CRASH":
+                if language == "python":
+                    reason = (
+                        f"Unhandled exception / non-zero exit "
+                        f"(exit {exit_code}) — check stderr for traceback"
+                    )
+                else:
+                    reason = "SIGSEGV (exit 139) — null-deref or memory corruption"
+            else:
+                reason = f"HANG — process did not exit within {EXEC_TIMEOUT}s"
+            crash_path = _save_crash(idx, payload, reason, exit_code,
+                                     " ".join(sandbox_cmd))
             await send_info(ws, f"Crash saved → {crash_path}")
 
         await send_result(ws, idx, payload, outcome, exit_code)
@@ -657,10 +764,11 @@ async def ws_fuzz(ws: WebSocket) -> None:
 
     Expected client message (once, on connect):
       {
-        "source_code": "<C++ source as a string>",
+        "source_code": "<C++ or Python source as a string>",
         "api_key"    : "<provider API key>",
         "provider"   : "gemini" | "groq",
-        "model_id"   : "<model string>"
+        "model_id"   : "<model string>",
+        "language"   : "cpp" | "python"   (optional, defaults to "cpp")
       }
 
     The api_key is used only for the duration of this request and is never
@@ -707,18 +815,29 @@ async def ws_fuzz(ws: WebSocket) -> None:
                 )
                 return
 
+            # language defaults to "cpp" for backwards compatibility with
+            # clients that pre-date the polyglot upgrade.
+            raw_lang = msg.get("language", "cpp")
+            if raw_lang not in ("cpp", "python"):
+                await send_info(
+                    ws,
+                    f"ERROR: language must be 'cpp' or 'python'.  Got: {raw_lang!r}"
+                )
+                return
+            language: Language = raw_lang  # type: ignore[assignment]
+
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             await send_info(ws, f"ERROR: Bad request — {exc}")
             return
 
         log.info(
-            "Request: provider=%s  model=%s  source_len=%d",
-            provider, model_id, len(source_code),
+            "Request: provider=%s  model=%s  language=%s  source_len=%d",
+            provider, model_id, language, len(source_code),
         )
         # NOTE: api_key is intentionally excluded from logs.
 
-        # ── Stage 1: Compile ─────────────────────────────────────────────
-        if not await stage_compile(ws, source_code):
+        # ── Stage 1: Compile / write source ──────────────────────────────
+        if not await stage_compile(ws, source_code, language):
             return
 
         # ── Stage 2: AI generation ───────────────────────────────────────
@@ -728,12 +847,13 @@ async def ws_fuzz(ws: WebSocket) -> None:
             api_key     = api_key,
             provider    = provider,   # type: ignore[arg-type]
             model_id    = model_id,
+            language    = language,
         )
         if payloads is None:
             return
 
         # ── Stage 3 + 4: Execute + triage ───────────────────────────────
-        results = await stage_execute(ws, payloads)
+        results = await stage_execute(ws, payloads, language)
 
         # ── Done summary ─────────────────────────────────────────────────
         counts: dict[str, int] = {}
@@ -761,7 +881,7 @@ async def ws_fuzz(ws: WebSocket) -> None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "3.0.0"}
 
 
 @app.get("/providers")

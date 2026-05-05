@@ -1,16 +1,20 @@
 /**
- * App.tsx — AI Fuzzer Dashboard  (v2: BYOK Multi-Provider)
+ * App.tsx — AI Fuzzer Dashboard  (v3: Polyglot — C++ & Python)
  * ════════════════════════════════════════════════════════════════
  * Single-file React dashboard for the AI-driven fuzzing pipeline.
  *
- * What changed in v2
+ * What changed in v3
  * ──────────────────
- * · New "AI Configuration" section above the code editor:
- *     - Provider dropdown  : Gemini | Groq
- *     - Model dropdown     : filtered by selected provider
- *     - API Key input      : password field, never logged
- * · WebSocket send payload now includes api_key, provider, model_id.
- * · Terminal shows which provider/model is active at launch.
+ * · Language selector dropdown (C++ / Python 3) above the source editor.
+ * · Switching language auto-loads the matching default source template.
+ * · WebSocket send payload now includes the "language" field.
+ * · Footer and textarea placeholder update dynamically per language.
+ *
+ * What was in v2 (unchanged)
+ * ──────────────────────────
+ * · AI Configuration section: Provider / Model / API Key (BYOK).
+ * · WebSocket send payload includes api_key, provider, model_id.
+ * · Terminal shows active provider/model at launch.
  *
  * Stack requirements (package.json):
  *   react, react-dom, typescript
@@ -66,7 +70,7 @@ const PROVIDER_MODELS: Record<string, string[]> = {
   groq  : ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
 };
 
-const DEFAULT_SOURCE = `#include <iostream>
+const DEFAULT_CPP = `#include <iostream>
 #include <string>
 
 int main() {
@@ -96,6 +100,41 @@ int main() {
     return 0;
 }`;
 
+/**
+ * Default Python victim.
+ * - "CRASH" → ZeroDivisionError (unhandled, exits non-zero)
+ * - "LOOP"  → infinite while-loop (SIGKILL / timeout)
+ * - else    → prints "Safe: <input>"
+ * The outer try/except EOFError handles the subprocess closing stdin
+ * without sending any data (empty pipe), which would otherwise raise an
+ * unrelated exception and mask the real fuzzing result.
+ */
+const DEFAULT_PYTHON = `import sys
+
+def main():
+    try:
+        data = input()
+    except EOFError:
+        print("[victim] stdin closed", file=sys.stderr)
+        sys.exit(1)
+
+    if data == "CRASH":
+        print("[victim] CRASH -> triggering ZeroDivisionError", file=sys.stderr)
+        # Deliberate unhandled exception — exits with code 1 and a traceback
+        result = 1 / 0  # noqa: F841
+
+    elif data == "LOOP":
+        print("[victim] LOOP -> spinning forever", file=sys.stderr)
+        while True:
+            pass  # infinite spin — killed by sandbox timeout
+
+    else:
+        print(f"Safe: {data}")
+
+if __name__ == "__main__":
+    main()
+`;
+
 // ANSI escape sequences for xterm colouring
 const ANSI = {
   reset   : "\x1b[0m",
@@ -117,6 +156,7 @@ const ANSI = {
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 type Provider   = "gemini" | "groq";
+type Language   = "cpp" | "python";
 type Outcome    = "CRASH" | "CLEAN" | "TIMEOUT" | "ERROR" | "PENDING";
 type FuzzerStatus =
   | "idle" | "connecting" | "compiling"
@@ -188,7 +228,8 @@ const App: FC = () => {
   const roRef          = useRef<ResizeObserver | null>(null);
 
   // ── Core fuzzer state ─────────────────────────────────────────────────────
-  const [sourceCode, setSourceCode] = useState<string>(DEFAULT_SOURCE);
+  const [sourceCode, setSourceCode] = useState<string>(DEFAULT_CPP);
+  const [language,   setLanguage  ] = useState<Language>("cpp");
   const [status,     setStatus    ] = useState<FuzzerStatus>("idle");
   const [results,    setResults   ] = useState<FuzzResult[]>([]);
   const [statusMsg,  setStatusMsg ] = useState<string>("Ready to fuzz.");
@@ -204,6 +245,15 @@ const App: FC = () => {
     const p = e.target.value as Provider;
     setProvider(p);
     setModelId(PROVIDER_MODELS[p][0]);
+  }, []);
+
+  // When the language changes, load the matching default source template.
+  // This gives the user an immediately runnable starting point without
+  // overwriting edits they've already made to the *same* language.
+  const handleLanguageChange = useCallback((e: ChangeEvent<HTMLSelectElement>) => {
+    const lang = e.target.value as Language;
+    setLanguage(lang);
+    setSourceCode(lang === "python" ? DEFAULT_PYTHON : DEFAULT_CPP);
   }, []);
 
   // ── xterm initialisation ──────────────────────────────────────────────────
@@ -404,6 +454,7 @@ const App: FC = () => {
     wsRef.current = ws;
 
     termWriteln(`${ANSI.dim}${ANSI.cyan}▶ Connecting to ${WS_URL}${ANSI.reset}`);
+    termWriteln(`${ANSI.dim}  Language : ${ANSI.magenta}${language === "python" ? "Python 3" : "C++ (g++)"}${ANSI.reset}`);
     termWriteln(`${ANSI.dim}  Provider : ${ANSI.magenta}${provider}${ANSI.reset}`);
     termWriteln(`${ANSI.dim}  Model    : ${ANSI.magenta}${modelId}${ANSI.reset}`);
     termWriteln(`${ANSI.dim}  API Key  : ${ANSI.magenta}${"•".repeat(Math.min(apiKey.length, 16))}${ANSI.reset}`);
@@ -417,6 +468,7 @@ const App: FC = () => {
         api_key    : apiKey,
         provider   : provider,
         model_id   : modelId,
+        language   : language,
       }));
     };
 
@@ -432,7 +484,7 @@ const App: FC = () => {
       termWriteln(`${ANSI.dim}WebSocket closed (code ${ev.code})${ANSI.reset}`);
       wsRef.current = null;
     };
-  }, [apiKey, provider, modelId, sourceCode, handleMessage, termClear, termWriteln]);
+  }, [apiKey, language, provider, modelId, sourceCode, handleMessage, termClear, termWriteln]);
 
   // Cleanup on unmount
   useEffect(() => () => { wsRef.current?.close(); }, []);
@@ -495,7 +547,7 @@ const App: FC = () => {
           >
             AI FUZZER
           </span>
-          <span className="text-zinc-600 text-xs font-mono">v2.0 / byok</span>
+          <span className="text-zinc-600 text-xs font-mono">v3.0 / polyglot</span>
         </div>
         <div className="flex items-center gap-4 text-xs font-mono">
           <StatusBadge />
@@ -609,6 +661,41 @@ const App: FC = () => {
             </div>
           </div>
 
+          {/* ── Language Selection ────────────────────────────────── */}
+          <div className="border-b border-zinc-800/40">
+            <div className="px-4 py-2.5 flex items-center gap-2">
+              <CircleDot className="w-3.5 h-3.5 text-zinc-500" />
+              <span className="text-xs font-mono tracking-widest text-zinc-400 uppercase">
+                Language
+              </span>
+            </div>
+
+            <div className="px-4 pb-4">
+              <div className="space-y-1">
+                <label className="block text-[10px] font-mono tracking-widest text-zinc-600 uppercase">
+                  Target Language
+                </label>
+                <div className="relative">
+                  <select
+                    value={language}
+                    onChange={handleLanguageChange}
+                    disabled={isRunning}
+                    className={selectCls}
+                  >
+                    <option value="cpp">C++ (g++)</option>
+                    <option value="python">Python 3</option>
+                  </select>
+                  <ChevronDown className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-600" />
+                </div>
+                <p className="text-[9px] text-zinc-700 font-mono">
+                  {language === "python"
+                    ? "Executed via: python3 victim.py"
+                    : "Compiled via: g++ -std=c++17 -O0"}
+                </p>
+              </div>
+            </div>
+          </div>
+
           {/* ── Target Source ─────────────────────────────────────────── */}
           <div className="px-4 py-2.5 border-b border-zinc-800/40 flex items-center gap-2">
             <FlaskConical className="w-4 h-4 text-zinc-500" />
@@ -629,7 +716,7 @@ const App: FC = () => {
               style={{ fontFamily: "'Share Tech Mono', monospace" }}
               value={sourceCode}
               onChange={e => setSourceCode(e.target.value)}
-              placeholder="Paste C++ source here…"
+              placeholder={language === "python" ? "Paste Python source here…" : "Paste C++ source here…"}
               spellCheck={false}
               disabled={isRunning}
             />
@@ -638,7 +725,7 @@ const App: FC = () => {
           <div className="px-4 py-2 border-t border-zinc-800/40 flex gap-4 text-[10px] font-mono text-zinc-600">
             <span>{sourceCode.split("\n").length} lines</span>
             <span>{sourceCode.length} chars</span>
-            <span className="ml-auto text-zinc-700">victim.cpp</span>
+            <span className="ml-auto text-zinc-700">{language === "python" ? "victim.py" : "victim.cpp"}</span>
           </div>
 
           {/* ── Launch button ─────────────────────────────────────────── */}
@@ -799,6 +886,8 @@ const App: FC = () => {
       <footer className="border-t border-zinc-800/40 px-6 py-2 flex items-center justify-between bg-[#07070d] text-[10px] font-mono text-zinc-700">
         <div className="flex items-center gap-4">
           <span>sandbox: seccomp-bpf + pivot_root + cgroups v2</span>
+          <span className="text-zinc-800">│</span>
+          <span className="text-zinc-600">{language === "python" ? "python3" : "g++ -std=c++17"}</span>
           <span className="text-zinc-800">│</span>
           <span className="text-zinc-600">{provider} / {modelId}</span>
         </div>
