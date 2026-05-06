@@ -27,3 +27,16 @@ dist-ssr/
 .DS_Store
 .vscode/
 .idea/
+
+# --- AI / ML Artifacts ---
+# Ignore the local model adapters and heavy weights
+auto-patch-v2-adapter/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.msgpack
+
+# Ignore Hugging Face cache/logs (if generated locally)
+.huggingface/
+runs/
